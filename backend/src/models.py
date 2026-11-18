@@ -48,6 +48,16 @@ class Separation(Base):
     complaint_id:Mapped[int]=mapped_column(ForeignKey('complaints.id'))
     state:Mapped[str]=mapped_column(String(20),default='queued')
     event_ids:Mapped[list]=mapped_column(JSON)
+    # 入队时冻结的事件快照；计算只读取它，之后新登记的频带事件不混入本任务。
+    snapshot:Mapped[list|None]=mapped_column(JSON,nullable=True)
+    # 认领次数；大于1说明任务中断后被恢复执行。
+    attempts:Mapped[int]=mapped_column(Integer,default=0)
+    # fencing令牌：每次认领重新签发，发布/心跳/标失败都按令牌条件更新，旧进程晚回来不能覆盖。
+    run_token:Mapped[str]=mapped_column(String(40),default='')
+    # 是否经历过中断回收。
+    recovered:Mapped[bool]=mapped_column(Boolean,default=False)
+    # 执行进程心跳；超时未刷新即被其他进程回收。
+    heartbeat_at:Mapped[datetime|None]=mapped_column(DateTime,nullable=True)
     result:Mapped[dict|None]=mapped_column(JSON,nullable=True)
     error:Mapped[str]=mapped_column(String(400),default='')
 class Attribution(Base):

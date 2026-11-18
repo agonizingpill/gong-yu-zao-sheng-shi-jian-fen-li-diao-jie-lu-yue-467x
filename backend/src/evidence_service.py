@@ -1,9 +1,9 @@
-import os
+import os,json
 import redis
 from sqlalchemy import select
 from fastapi import HTTPException
 from .models import NoiseEvent,Separation,Attribution,Agreement,Remedy,Breach
-from .common import require,lock_case,record,now,dump,within_window
+from .common import require,lock_case,record,now,dump,within_window,get,ARTIFACTS_DIR
 queue=redis.Redis.from_url(os.getenv('REDIS_URL','redis://redis:6379/0'),decode_responses=True,socket_connect_timeout=2,socket_timeout=2)
 def create_event(db,user,caseid,data):
     case=lock_case(db,caseid)
@@ -12,6 +12,8 @@ def create_event(db,user,caseid,data):
     require(data.measured_at<=now(db),'监测时间不可晚于演示时钟')
     require(not db.scalar(select(NoiseEvent).where(NoiseEvent.complaint_id==caseid,NoiseEvent.measured_at==data.measured_at,NoiseEvent.position==data.position)),'同地点同一时刻已登记事件，禁止重复计数')
     row=NoiseEvent(complaint_id=caseid,**data.model_dump(),total=sum(data.energies));db.add(row);db.flush()
+    # 源数据已更新：既有分离结果立即失效，仅留档备查，不能再用于确认归因。
+    for s in db.scalars(select(Separation).where(Separation.complaint_id==caseid,Separation.state=='done')).all():s.state='stale'
     agreements=db.scalars(select(Agreement).where(Agreement.complaint_id==caseid,Agreement.state.in_(['active','observing','breached']))).all()
     for a in agreements:
         # 复发必须在整改交付之后且处于约定的静音时段。
@@ -26,7 +28,9 @@ def start_separation(db,user,caseid):
     events=db.scalars(select(NoiseEvent).where(NoiseEvent.complaint_id==caseid).order_by(NoiseEvent.id)).all()
     require(len(events)>=3,'至少需要3条频带事件才可分离成分')
     require(not db.scalar(select(Separation).where(Separation.complaint_id==caseid,Separation.state.in_(['queued','running']))),'已有成分分离正在运行')
-    job=Separation(complaint_id=caseid,event_ids=[e.id for e in events]);db.add(job);db.flush();record(db,user,'separation.queue',job.id,caseid)
+    snapshot=[{'id':e.id,'energies':list(e.energies)} for e in events]
+    # 快照随任务冻结，worker只按快照计算；之后新登记的频带事件不会混入本任务。
+    job=Separation(complaint_id=caseid,event_ids=[e['id'] for e in snapshot],snapshot=snapshot);db.add(job);db.flush();record(db,user,'separation.queue',job.id,caseid)
     # 入列失败会使事务回滚；worker先锁投诉再锁任务，保证相同顺序。
     try:queue.rpush('quiet:separation',str(job.id))
     except redis.RedisError:raise HTTPException(503,'计算队列暂不可用，任务未创建；恢复后可重试')
@@ -34,9 +38,21 @@ def start_separation(db,user,caseid):
 def confirm(db,user,caseid,data):
     case=lock_case(db,caseid);require(case.status!='closed','已结案不能修改归因')
     job=db.get(Separation,data.separation_id)
-    require(job is not None and job.complaint_id==caseid and job.state=='done','须选择本卷已完成的成分分离')
+    require(job is not None and job.complaint_id==caseid,'须选择本卷的分离记录')
+    require(job.state=='done','该分离结果已失效或尚未完成，请重新分离后再复核')
     ids=list(db.scalars(select(NoiseEvent.id).where(NoiseEvent.complaint_id==caseid).order_by(NoiseEvent.id)))
     require(ids==job.event_ids,'频带事件已变更，请重新分离后复核')
     require(not db.scalar(select(Attribution).where(Attribution.separation_id==job.id)),'该分离记录已由人工复核')
     row=Attribution(complaint_id=caseid,separation_id=job.id,source=data.source,evidence=data.evidence,reviewer=user.username);db.add(row)
     case.status='mediation';record(db,user,'attribution.confirm',caseid,data.evidence);db.commit();return dump(row)
+def artifact(db,caseid,sid):
+    job=get(db,Separation,sid)
+    require(job.complaint_id==caseid,'分离记录不属于本卷')
+    require(job.result,'该分离尚未发布结果')
+    # 分离页与留档取同一份结果：留档文件缺失或不一致时，以库内结果重写留档。
+    path=ARTIFACTS_DIR/f'separation-{sid}.json'
+    try:
+        ARTIFACTS_DIR.mkdir(exist_ok=True)
+        if not(path.exists() and json.loads(path.read_text())==job.result):path.write_text(json.dumps(job.result,ensure_ascii=False))
+    except(OSError,ValueError):pass
+    return job.result

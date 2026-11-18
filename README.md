@@ -47,6 +47,8 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 `backend/src/separation.py` 用seed1040合成360行非负8频带，前280行fit NMF，后80行只transform。3个成分用合成已知模板的余弦相似度作匈牙利配对，报告留出相对重构RMSE与混合占比MAE。实际事件只transform，成分占比经基底总能量加权归一。记录训练数据与事件快照SHA256、迭代次数、失败态。worker输出持久化到分离记录和共享artifacts卷。Redis仅唤醒，worker每次循环也从数据库扫描queued；入列失败返回503且事务回滚，恢复后可重新提交。
 
+分离任务可中断恢复：事件快照随任务冻结，之后新登记的事件不混入；worker心跳超时（默认12秒）即把中断的running任务退回队列，按原快照接着处理，不新建任务；每次认领签发fencing令牌，发布、心跳、标失败均按令牌条件更新，旧进程晚回来不能覆盖已恢复的结果；结果先写临时文件、库内发布成功后才转正留档，分离页与 `GET /complaints/{id}/separations/{sid}/artifact` 取同一份结果。新增频带事件后，旧分离结果立即失效转入留档（stale），不能再用于归因确认。
+
 固定合成模板不代表真实环境泛化能力；相对能量不是dB，频带分解不证明声源或住户身份，所有归因需要主管现场证据。无原始录音、不提供声学合规或法律判断。
 
 ## 结构与本地开发

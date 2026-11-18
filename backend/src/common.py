@@ -1,6 +1,11 @@
+import os
+from pathlib import Path
 from sqlalchemy import select
 from fastapi import HTTPException
 from .models import Complaint,DemoClock,Audit,Agreement
+
+# 分离结果留档目录，worker发布与后端留档接口共用，保证两边取到同一份结果。
+ARTIFACTS_DIR=Path(os.getenv('ARTIFACTS_DIR','/artifacts'))
 
 def require(ok,message,code=409):
     if not ok: raise HTTPException(code,message)
